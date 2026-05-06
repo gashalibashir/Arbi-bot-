@@ -2,16 +2,16 @@ name: ⚡ ArbScanner Pro — 24/7
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch:
+    - cron: "*/5 * * * *"   # Every 5 minutes
+  workflow_dispatch:        # Allows manual trigger
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
-
+    timeout-minutes: 6        # Increased slightly for safety
+    
     steps:
-      - name: Checkout
+      - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Setup Node.js
