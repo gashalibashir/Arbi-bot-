@@ -20,14 +20,22 @@ res.on(“data”, function(c) { data += c; });
 res.on(“end”, function() {
 try { resolve(JSON.parse(data)); }
 catch(e) {
-console.error(“Bad JSON from “ + url + “ status:” + res.statusCode);
-console.error(“Preview: “ + data.substring(0, 300));
-reject(new Error(“Bad JSON”));
+console.error(“Bad JSON from “ + url);
+console.error(“HTTP status: “ + res.statusCode);
+console.error(“Headers: “ + JSON.stringify(res.headers));
+console.error(“Body preview: “ + data.substring(0, 500));
+reject(new Error(“Bad JSON: HTTP “ + res.statusCode));
 }
 });
 });
-req.on(“error”, reject);
-req.setTimeout(15000, function() { req.destroy(); reject(new Error(“Timeout”)); });
+req.on(“error”, function(e) {
+console.error(“Request error for “ + url + “: “ + e.message);
+reject(e);
+});
+req.setTimeout(20000, function() {
+req.destroy();
+reject(new Error(“Timeout: “ + url));
+});
 });
 }
 
@@ -65,11 +73,12 @@ function sleep(ms) {
 return new Promise(function(r) { setTimeout(r, ms); });
 }
 
-// Kraken: fetch all tickers, filter USDT pairs using wsname field from AssetPairs
+// Kraken: uses AssetPairs to map internal keys -> normalised XXXUSDT symbols,
+// then fetches all tickers in one call.
 function fetchKraken() {
-// First get AssetPairs to build a wsname -> normalized symbol map (e.g. “BTC/USDT” -> “BTCUSDT”)
+console.log(“Fetching Kraken AssetPairs…”);
 return get(“https://api.kraken.com/0/public/AssetPairs”).then(function(pairsData) {
-var pairMap = {}; // krakenPairKey -> normalizedSymbol (e.g. “BTCUSDT”)
+var pairMap = {};
 if (pairsData.result) {
 Object.keys(pairsData.result).forEach(function(key) {
 var pair = pairsData.result[key];
@@ -80,15 +89,20 @@ pairMap[key] = base + “USDT”;
 }
 });
 }
+console.log(“Kraken USDT pairs found in AssetPairs: “ + Object.keys(pairMap).length);
 
 ```
+console.log("Fetching Kraken Ticker...");
 return get("https://api.kraken.com/0/public/Ticker").then(function(data) {
   var map = {};
-  if (!data.result) return map;
+  if (!data.result) {
+    console.error("Kraken Ticker: no result field. Keys: " + Object.keys(data).join(", "));
+    return map;
+  }
   Object.keys(data.result).forEach(function(key) {
     var sym = pairMap[key];
     if (!sym) return;
-    var p = parseFloat(data.result[key].c[0]); // c[0] = last trade price
+    var p = parseFloat(data.result[key].c[0]);
     if (p > 0) map[sym] = p;
   });
   console.log("Kraken: " + Object.keys(map).length + " USDT pairs");
@@ -102,29 +116,30 @@ return {};
 });
 }
 
-// Bitfinex: fetch all tickers, filter tXXXUST pairs (UST = USDT on Bitfinex)
+// Bitfinex: fetch all tickers, filter tXXXUST (USDT) pairs.
+// index 7 = LAST_PRICE in the ticker array.
 function fetchBitfinex() {
+console.log(“Fetching Bitfinex tickers…”);
 return get(“https://api-pub.bitfinex.com/v2/tickers?symbols=ALL”).then(function(data) {
 var map = {};
-if (!Array.isArray(data)) return map;
+if (!Array.isArray(data)) {
+console.error(“Bitfinex: expected array, got: “ + typeof data);
+return map;
+}
 data.forEach(function(ticker) {
-var sym = ticker[0]; // e.g. “tBTCUST”
+var sym = ticker[0];
 if (!sym || sym[0] !== “t”) return;
-// Bitfinex uses UST for USDT; also support USDT suffix
-var isUST  = sym.endsWith(“UST”)  && !sym.endsWith(”:UST”);
-var isUSDT = sym.endsWith(“USDT”) && !sym.endsWith(”:USDT”);
+// Bitfinex uses UST for USDT; also handle USDT suffix
+var isUST  = sym.endsWith(“UST”)  && !sym.includes(”:”);
+var isUSDT = sym.endsWith(“USDT”) && !sym.includes(”:”);
 if (!isUST && !isUSDT) return;
-// ticker[7] = LAST_PRICE
-var p = parseFloat(ticker[7]);
+var p = parseFloat(ticker[7]); // LAST_PRICE
 if (!p || p <= 0) return;
-// Normalize to XXXUSDT
 var base;
-if (isUST)  base = sym.slice(1, -3); // strip leading “t” and trailing “UST”
-if (isUSDT) base = sym.slice(1, -4); // strip leading “t” and trailing “USDT”
-// Skip derivatives / colons
-if (base.includes(”:”) || base.includes(“F0”)) return;
-var normalized = base + “USDT”;
-map[normalized] = p;
+if (isUST)  base = sym.slice(1, -3);
+if (isUSDT) base = sym.slice(1, -4);
+if (!base || base.includes(“F0”)) return;
+map[base + “USDT”] = p;
 });
 console.log(“Bitfinex: “ + Object.keys(map).length + “ USDT pairs”);
 return map;
@@ -203,6 +218,8 @@ var krakenTotal = Object.keys(kraken).length;
 var bitfinexTotal = Object.keys(bitfinex).length;
 var common = Object.keys(kraken).filter(function(s) { return bitfinex[s]; }).length;
 
+console.log(“Kraken pairs: “ + krakenTotal);
+console.log(“Bitfinex pairs: “ + bitfinexTotal);
 console.log(“Common pairs: “ + common);
 
 if (krakenTotal === 0 || bitfinexTotal === 0) {
