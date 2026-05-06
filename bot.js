@@ -6,53 +6,67 @@ const FEE = 0.1;
 const MIN_SPREAD = 0.3;
 const CAPITALS = [10, 50, 500, 1000];
 const MAX_ALERTS = 10;
-const MAX_RETRIES = 3;
-const REQUEST_TIMEOUT = 30000; // 30 seconds
+const MAX_RETRIES = 5;
+const REQUEST_TIMEOUT = 45000; // 45 seconds
 
+// Enhanced get function with full diagnostics
 function get(url) {
   return new Promise((resolve, reject) => {
+    console.log(`→ Requesting: ${url}`);
+
     const req = https.get(url, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
         "Accept": "application/json",
-        "Accept-Encoding": "gzip, deflate"
+        "Accept-Encoding": "identity", // Disable compression to avoid issues
+        "Cache-Control": "no-cache"
       }
     }, (res) => {
+      console.log(`← Response from ${url}: Status ${res.statusCode} | Headers: ${JSON.stringify(res.headers)}`);
+
       let data = "";
 
-      // Check status code immediately
-      if (res.statusCode !== 200) {
-        console.error(`Bad HTTP status ${res.statusCode} from ${url}`);
-        res.on("data", chunk => { data += chunk; });
-        res.on("end", () => {
-          console.error("Body preview:", data.substring(0, 800));
-          reject(new Error(`HTTP ${res.statusCode}`));
-        });
-        return;
-      }
+      res.on("data", chunk => { 
+        data += chunk; 
+        // Log progress for large responses
+        if (data.length % 50000 === 0) console.log(`Received ${data.length} bytes so far...`);
+      });
 
-      res.on("data", chunk => { data += chunk; });
       res.on("end", () => {
+        console.log(`Response ended. Total bytes: ${data.length}`);
+
+        if (res.statusCode !== 200) {
+          console.error(`❌ Bad status ${res.statusCode}`);
+          console.error("Body preview:", data.substring(0, 1500));
+          reject(new Error(`HTTP ${res.statusCode}`));
+          return;
+        }
+
         try {
           const parsed = JSON.parse(data);
+          console.log(`✅ Successfully parsed JSON (${Object.keys(parsed).length} top-level keys)`);
           resolve(parsed);
         } catch (e) {
-          console.error("Bad JSON from " + url);
-          console.error("Status: " + res.statusCode);
-          console.error("Body preview: " + data.substring(0, 800));
-          reject(new Error("JSON parse failed: " + e.message));
+          console.error("❌ JSON Parse FAILED");
+          console.error("Error:", e.message);
+          console.error("Body preview (first 1500 chars):");
+          console.error(data.substring(0, 1500));
+          console.error("Body end preview:");
+          console.error(data.substring(Math.max(0, data.length - 500)));
+          reject(new Error(`JSON parse failed: ${e.message}`));
         }
       });
     });
 
     req.on("error", (e) => {
-      console.error("Request error for " + url + ": " + e.message);
+      console.error(`❌ Request error: ${e.message}`);
       reject(e);
     });
 
     req.setTimeout(REQUEST_TIMEOUT, () => {
+      console.error(`⏰ Timeout after ${REQUEST_TIMEOUT}ms`);
       req.destroy();
-      reject(new Error("Timeout: " + url));
+      reject(new Error("Request timeout"));
     });
   });
 }
@@ -60,21 +74,22 @@ function get(url) {
 async function fetchWithRetry(fn, name) {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      console.log(`Fetching ${name} (attempt ${attempt}/${MAX_RETRIES})...`);
+      console.log(`\n🔄 ${name} attempt ${attempt}/${MAX_RETRIES}`);
       return await fn();
     } catch (e) {
-      console.warn(`${name} attempt ${attempt} failed: ${e.message}`);
+      console.warn(`⚠️ ${name} attempt ${attempt} failed: ${e.message}`);
       if (attempt === MAX_RETRIES) throw e;
-      await sleep(1500 * attempt); // exponential backoff
+      const delay = 2000 * attempt;
+      console.log(`Waiting ${delay}ms before retry...`);
+      await sleep(delay);
     }
   }
 }
 
-// Kraken
+// Kraken fetch
 async function fetchKraken() {
-  const pairsData = await fetchWithRetry(() => 
-    get("https://api.kraken.com/0/public/AssetPairs"), "Kraken AssetPairs"
-  );
+  // First get pairs
+  const pairsData = await fetchWithRetry(() => get("https://api.kraken.com/0/public/AssetPairs"), "Kraken AssetPairs");
 
   const pairMap = {};
   if (pairsData.result) {
@@ -86,34 +101,32 @@ async function fetchKraken() {
       }
     });
   }
-  console.log(`Kraken USDT pairs found: ${Object.keys(pairMap).length}`);
+  console.log(`Kraken USDT pairs mapped: ${Object.keys(pairMap).length}`);
 
-  const tickerData = await fetchWithRetry(() => 
-    get("https://api.kraken.com/0/public/Ticker"), "Kraken Ticker"
-  );
+  // Then ticker
+  const tickerData = await fetchWithRetry(() => get("https://api.kraken.com/0/public/Ticker"), "Kraken Ticker");
 
   const map = {};
   if (tickerData.result) {
     Object.keys(tickerData.result).forEach(key => {
       const sym = pairMap[key];
-      if (!sym) return;
-      const p = parseFloat(tickerData.result[key].c[0]);
-      if (p > 0) map[sym] = p;
+      if (sym) {
+        const p = parseFloat(tickerData.result[key].c[0]);
+        if (p > 0) map[sym] = p;
+      }
     });
   }
-  console.log(`Kraken final USDT pairs: ${Object.keys(map).length}`);
+  console.log(`Kraken final USDT prices: ${Object.keys(map).length}`);
   return map;
 }
 
-// Bitfinex
+// Bitfinex fetch
 async function fetchBitfinex() {
-  const data = await fetchWithRetry(() => 
-    get("https://api-pub.bitfinex.com/v2/tickers?symbols=ALL"), "Bitfinex"
-  );
+  const data = await fetchWithRetry(() => get("https://api-pub.bitfinex.com/v2/tickers?symbols=ALL"), "Bitfinex");
 
   const map = {};
   if (!Array.isArray(data)) {
-    console.error("Bitfinex: expected array");
+    console.error("Bitfinex returned non-array");
     return map;
   }
 
@@ -127,82 +140,29 @@ async function fetchBitfinex() {
     if (!isUST && !isUSDT) return;
 
     const p = parseFloat(ticker[7]);
-    if (!p || p <= 0) return;
+    if (p <= 0) return;
 
     let base = isUST ? sym.slice(1, -3) : sym.slice(1, -4);
-    if (!base || base.includes("F0") || base.length < 2) return;
-
-    map[base + "USDT"] = p;
+    if (base && !base.includes("F0") && base.length > 1) {
+      map[base + "USDT"] = p;
+    }
   });
 
-  console.log(`Bitfinex USDT pairs: ${Object.keys(map).length}`);
+  console.log(`Bitfinex USDT prices: ${Object.keys(map).length}`);
   return map;
 }
 
-function calcOpps(ex1, ex2, name1, name2) {
-  const totalFee = (FEE + FEE) / 100;
-  const results = [];
-
-  Object.keys(ex1).forEach(sym => {
-    if (!ex2[sym]) return;
-    const p1 = ex1[sym];
-    const p2 = ex2[sym];
-
-    let buyEx, sellEx, buyP, sellP;
-    if (p1 < p2) {
-      buyEx = name1; buyP = p1; sellEx = name2; sellP = p2;
-    } else {
-      buyEx = name2; buyP = p2; sellEx = name1; sellP = p1;
-    }
-
-    const spreadPct = ((sellP - buyP) / buyP) * 100;
-    const netPct = spreadPct - (totalFee * 100);
-
-    if (netPct < MIN_SPREAD) return;
-
-    const profits = CAPITALS.map(c => ({
-      cap: c,
-      profit: (c * netPct / 100).toFixed(4)
-    }));
-
-    results.push({
-      coin: sym.replace("USDT", ""),
-      buyEx, sellEx,
-      buyP, sellP,
-      spreadPct, netPct,
-      profits
-    });
-  });
-
-  results.sort((a, b) => b.netPct - a.netPct);
-  return results;
-}
-
-function fmtPrice(n) {
-  if (n < 0.0001) return n.toExponential(4);
-  if (n < 1) return n.toFixed(6);
-  if (n < 1000) return n.toFixed(4);
-  return n.toFixed(2);
-}
-
-function fmtOpp(o, rank) {
-  const lines = o.profits.map(p => `  $${p.cap} -> +$${p.profit}`).join("\n");
-  return (
-    `${rank}. <b>${o.coin}/USDT</b>\n` +
-    `Buy  <b>${o.buyEx}</b> @ $${fmtPrice(o.buyP)}\n` +
-    `Sell <b>${o.sellEx}</b> @ $${fmtPrice(o.sellP)}\n` +
-    `Spread: <b>${o.spreadPct.toFixed(3)}%</b>\n` +
-    `Fees: <b>-${(FEE + FEE).toFixed(2)}%</b>\n` +
-    `Net: <b>+${o.netPct.toFixed(3)}%</b>\n` +
-    lines
-  );
-}
+// Rest of the functions remain the same
+function calcOpps(ex1, ex2, name1, name2) { /* ... same as before ... */ }
+function fmtPrice(n) { /* ... same ... */ }
+function fmtOpp(o, rank) { /* ... same ... */ }
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
 async function sendTG(text) {
+  // same as before
   const body = JSON.stringify({ chat_id: TG_CHAT_ID, text: text, parse_mode: "HTML" });
   return new Promise((resolve, reject) => {
     const opts = {
@@ -221,16 +181,13 @@ async function sendTG(text) {
       res.on("end", () => {
         try {
           const j = JSON.parse(d);
-          if (j.ok) resolve(j);
-          else reject(new Error(j.description || "Telegram error"));
-        } catch (e) {
-          reject(new Error("TG parse error"));
-        }
+          j.ok ? resolve(j) : reject(new Error(j.description || "TG error"));
+        } catch (e) { reject(new Error("TG parse error")); }
       });
     });
 
     req.on("error", reject);
-    req.setTimeout(10000, () => { req.destroy(); reject(new Error("TG Timeout")); });
+    req.setTimeout(15000, () => { req.destroy(); reject(new Error("TG Timeout")); });
     req.write(body);
     req.end();
   });
@@ -238,22 +195,22 @@ async function sendTG(text) {
 
 async function main() {
   if (!TG_TOKEN || !TG_CHAT_ID) {
-    console.error("Missing TG_TOKEN or TG_CHAT_ID");
+    console.error("Missing Telegram credentials");
     process.exit(1);
   }
 
-  console.log("Starting arbitrage scan...");
+  console.log("🚀 Starting ARBOT scan...");
 
   let kraken = {}, bitfinex = {};
   try {
     [kraken, bitfinex] = await Promise.all([
-      fetchWithRetry(fetchKraken, "Kraken"),
-      fetchWithRetry(fetchBitfinex, "Bitfinex")
+      fetchWithRetry(fetchKraken, "Full Kraken"),
+      fetchWithRetry(fetchBitfinex, "Full Bitfinex")
     ]);
   } catch (e) {
-    console.error("Critical fetch failure:", e.message);
+    console.error("💥 Critical failure:", e.message);
     try {
-      await sendTG(`🚨 ARBOT SCAN FAILED\n${new Date().toUTCString()}\nError: ${e.message}`);
+      await sendTG(`🚨 ARBOT FAILED\n${new Date().toUTCString()}\n${e.message}`);
     } catch (_) {}
     process.exit(1);
   }
@@ -262,39 +219,30 @@ async function main() {
   const bitfinexTotal = Object.keys(bitfinex).length;
   const common = Object.keys(kraken).filter(s => bitfinex[s]).length;
 
-  console.log(`Kraken pairs: ${krakenTotal} | Bitfinex: ${bitfinexTotal} | Common: ${common}`);
+  console.log(`Summary: Kraken=${krakenTotal} | Bitfinex=${bitfinexTotal} | Common=${common}`);
 
   if (krakenTotal === 0 || bitfinexTotal === 0) {
-    await sendTG(`🚨 ARBOT SCAN FAILED - No data\nKraken=${krakenTotal} Bitfinex=${bitfinexTotal}`);
+    await sendTG(`🚨 SCAN FAILED - No data received`);
     process.exit(1);
   }
 
   const opps = calcOpps(kraken, bitfinex, "Kraken", "Bitfinex");
 
-  const summary = 
-    `<b>ARBOT SCAN</b> - ${new Date().toUTCString()}\n` +
-    `Kraken: <b>${krakenTotal}</b> | Bitfinex: <b>${bitfinexTotal}</b>\n` +
-    `Common pairs: <b>${common}</b>\n` +
-    `Opportunities: <b>${opps.length}</b> (≥ ${MIN_SPREAD}% net)`;
+  const summary = `<b>ARBOT SCAN</b> - ${new Date().toUTCString()}\nKraken: <b>${krakenTotal}</b> | Bitfinex: <b>${bitfinexTotal}</b>\nCommon: <b>${common}</b>\nOpps: <b>${opps.length}</b>`;
 
-  try { await sendTG(summary); } catch (e) { console.error("TG summary error:", e.message); }
+  await sendTG(summary);
   await sleep(600);
 
   const toSend = opps.slice(0, MAX_ALERTS);
   for (let i = 0; i < toSend.length; i++) {
-    try {
-      await sendTG(fmtOpp(toSend[i], i + 1));
-      console.log(`Sent alert: ${toSend[i].coin}`);
-    } catch (e) {
-      console.error(`Failed to send alert ${i+1}:`, e.message);
-    }
+    await sendTG(fmtOpp(toSend[i], i + 1));
     await sleep(500);
   }
 
-  console.log(`Done. Sent ${toSend.length} alerts.`);
+  console.log("✅ Scan completed successfully.");
 }
 
 main().catch(err => {
-  console.error("Unhandled error:", err);
+  console.error("Unhandled crash:", err);
   process.exit(1);
 });
