@@ -65,35 +65,71 @@ function sleep(ms) {
 return new Promise(function(r) { setTimeout(r, ms); });
 }
 
-function fetchBybit() {
-return get(“https://api.bybit.com/v5/market/tickers?category=spot”).then(function(data) {
-var map = {};
-if (!data.result || !data.result.list) return map;
-data.result.list.forEach(function(t) {
-var p = parseFloat(t.lastPrice);
-if (t.symbol.endsWith(“USDT”) && p > 0) map[t.symbol] = p;
+// Kraken: fetch all tickers, filter USDT pairs using wsname field from AssetPairs
+function fetchKraken() {
+// First get AssetPairs to build a wsname -> normalized symbol map (e.g. “BTC/USDT” -> “BTCUSDT”)
+return get(“https://api.kraken.com/0/public/AssetPairs”).then(function(pairsData) {
+var pairMap = {}; // krakenPairKey -> normalizedSymbol (e.g. “BTCUSDT”)
+if (pairsData.result) {
+Object.keys(pairsData.result).forEach(function(key) {
+var pair = pairsData.result[key];
+var wsname = pair.wsname; // e.g. “XBT/USDT”
+if (wsname && wsname.endsWith(”/USDT”)) {
+var base = wsname.replace(”/USDT”, “”).replace(“XBT”, “BTC”);
+pairMap[key] = base + “USDT”;
+}
 });
-console.log(“Bybit: “ + Object.keys(map).length + “ pairs”);
-return map;
+}
+
+```
+return get("https://api.kraken.com/0/public/Ticker").then(function(data) {
+  var map = {};
+  if (!data.result) return map;
+  Object.keys(data.result).forEach(function(key) {
+    var sym = pairMap[key];
+    if (!sym) return;
+    var p = parseFloat(data.result[key].c[0]); // c[0] = last trade price
+    if (p > 0) map[sym] = p;
+  });
+  console.log("Kraken: " + Object.keys(map).length + " USDT pairs");
+  return map;
+});
+```
+
 }).catch(function(e) {
-console.error(“Bybit failed: “ + e.message);
+console.error(“Kraken failed: “ + e.message);
 return {};
 });
 }
 
-function fetchGate() {
-return get(“https://api.gateio.ws/api/v4/spot/tickers”).then(function(data) {
+// Bitfinex: fetch all tickers, filter tXXXUST pairs (UST = USDT on Bitfinex)
+function fetchBitfinex() {
+return get(“https://api-pub.bitfinex.com/v2/tickers?symbols=ALL”).then(function(data) {
 var map = {};
 if (!Array.isArray(data)) return map;
-data.forEach(function(t) {
-var sym = t.currency_pair.replace(”_”, “”);
-var p = parseFloat(t.last);
-if (sym.endsWith(“USDT”) && p > 0) map[sym] = p;
+data.forEach(function(ticker) {
+var sym = ticker[0]; // e.g. “tBTCUST”
+if (!sym || sym[0] !== “t”) return;
+// Bitfinex uses UST for USDT; also support USDT suffix
+var isUST  = sym.endsWith(“UST”)  && !sym.endsWith(”:UST”);
+var isUSDT = sym.endsWith(“USDT”) && !sym.endsWith(”:USDT”);
+if (!isUST && !isUSDT) return;
+// ticker[7] = LAST_PRICE
+var p = parseFloat(ticker[7]);
+if (!p || p <= 0) return;
+// Normalize to XXXUSDT
+var base;
+if (isUST)  base = sym.slice(1, -3); // strip leading “t” and trailing “UST”
+if (isUSDT) base = sym.slice(1, -4); // strip leading “t” and trailing “USDT”
+// Skip derivatives / colons
+if (base.includes(”:”) || base.includes(“F0”)) return;
+var normalized = base + “USDT”;
+map[normalized] = p;
 });
-console.log(“Gate.io: “ + Object.keys(map).length + “ pairs”);
+console.log(“Bitfinex: “ + Object.keys(map).length + “ USDT pairs”);
 return map;
 }).catch(function(e) {
-console.error(“Gate.io failed: “ + e.message);
+console.error(“Bitfinex failed: “ + e.message);
 return {};
 });
 }
@@ -159,28 +195,28 @@ process.exit(1);
 
 console.log(“Starting scan…”);
 
-var results = await Promise.all([fetchBybit(), fetchGate()]);
-var bybit = results[0];
-var gate = results[1];
+var results = await Promise.all([fetchKraken(), fetchBitfinex()]);
+var kraken = results[0];
+var bitfinex = results[1];
 
-var bybitTotal = Object.keys(bybit).length;
-var gateTotal = Object.keys(gate).length;
-var common = Object.keys(bybit).filter(function(s) { return gate[s]; }).length;
+var krakenTotal = Object.keys(kraken).length;
+var bitfinexTotal = Object.keys(bitfinex).length;
+var common = Object.keys(kraken).filter(function(s) { return bitfinex[s]; }).length;
 
 console.log(“Common pairs: “ + common);
 
-if (bybitTotal === 0 || gateTotal === 0) {
+if (krakenTotal === 0 || bitfinexTotal === 0) {
 console.error(“One or both APIs returned no data”);
-try { await sendTG(“Scan failed: API issue. Bybit=” + bybitTotal + “ Gate=” + gateTotal); } catch(e) {}
+try { await sendTG(“Scan failed: API issue. Kraken=” + krakenTotal + “ Bitfinex=” + bitfinexTotal); } catch(e) {}
 process.exit(1);
 }
 
-var opps = calcOpps(bybit, gate, “Bybit”, “Gate.io”);
+var opps = calcOpps(kraken, bitfinex, “Kraken”, “Bitfinex”);
 
 var summary = (
 “<b>ARBOT SCAN</b> - “ + new Date().toUTCString() + “\n” +
-“Bybit pairs: <b>” + bybitTotal + “</b>\n” +
-“Gate.io pairs: <b>” + gateTotal + “</b>\n” +
+“Kraken pairs: <b>” + krakenTotal + “</b>\n” +
+“Bitfinex pairs: <b>” + bitfinexTotal + “</b>\n” +
 “Common: <b>” + common + “</b>\n” +
 “Opportunities: <b>” + opps.length + “</b> (min “ + MIN_SPREAD + “% net)\n”
 );
